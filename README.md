@@ -1,125 +1,124 @@
-To implement this in a **CQRS** pattern with Go and Postgres, we will split the schema into two parts: the **Write Side** (Normalised tables for data integrity) and the **Read Side** (Denormalized tables for high-performance queries).
+# providers.io
 
-### 1. The Write Side (Source of Truth)
+A demo payment service where agents submit payments via HTTP API. Payments are persisted immediately, then processed asynchronously via a **Temporal** workflow with automatic retries.
 
-These tables are highly normalized. We use a `balance_log` to ensure every change to a partner's balance is auditable and traceable to a specific event (Transaction, Top-up, or Cancellation).
-
-```sql
--- Core Configuration
-CREATE TABLE partners (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    name VARCHAR(255) NOT NULL,
-    country CHAR(2),
-    info JSONB,
-    account_number VARCHAR(50) UNIQUE,
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
-);
-
-CREATE TABLE providers (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    name VARCHAR(255) NOT NULL,
-    partner_id UUID REFERENCES partners(id), -- The partner owning this provider connection
-    gate VARCHAR(100),
-    currency CHAR(3),
-    active BOOLEAN DEFAULT true,
-    min_amount DECIMAL(18,2),
-    max_amount DECIMAL(18,2),
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
-);
-
--- Transaction Ledger
-CREATE TYPE transaction_status AS ENUM ('pending', 'success', 'failed', 'canceled');
-
-CREATE TABLE transactions (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    provider_id UUID REFERENCES providers(id),
-    agent_id UUID REFERENCES partners(id), -- The partner triggering the transaction
-    ref_id VARCHAR(100) UNIQUE,            -- External reference ID
-    amount DECIMAL(18,2) NOT NULL,
-    fee DECIMAL(18,2) DEFAULT 0.00,
-    status transaction_status DEFAULT 'pending',
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-    canceled_at TIMESTAMP WITH TIME ZONE
-);
-
--- Audit Log for all balance movements
-CREATE TYPE movement_type AS ENUM ('payment', 'topup', 'cancellation');
-
-CREATE TABLE balance_log (
-    id BIGSERIAL PRIMARY KEY,
-    partner_id UUID REFERENCES partners(id),
-    provider_id UUID REFERENCES providers(id),
-    transaction_id UUID REFERENCES transactions(id), -- NULL if it's a manual top-up
-    amount DECIMAL(18,2) NOT NULL,                   -- Negative for payments, Positive for topups/cancels
-    type movement_type NOT NULL,
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
-);
+## Architecture
 
 ```
-
----
-
-### 2. The Read Side (Projections)
-
-These tables are optimized for the queries you mentioned. They are updated via **database triggers** or **Go application logic** within the same transaction as the write.
-
-```sql
--- 1. Query: "Remain of balance in partners by providers"
-CREATE TABLE partner_provider_balances (
-    partner_id UUID REFERENCES partners(id),
-    provider_id UUID REFERENCES providers(id),
-    current_balance DECIMAL(18,2) DEFAULT 0.00,
-    last_updated TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-    PRIMARY KEY (partner_id, provider_id)
-);
-
--- 2. Query: "Counts by day, total amount by day"
-CREATE TABLE daily_stats_projection (
-    day DATE,
-    provider_id UUID REFERENCES providers(id),
-    total_amount DECIMAL(18,2) DEFAULT 0.00,
-    total_fee DECIMAL(18,2) DEFAULT 0.00,
-    success_count INT DEFAULT 0,
-    cancel_count INT DEFAULT 0,
-    PRIMARY KEY (day, provider_id)
-);
-
+Agent → POST /payments → Insert (pending) → 202 Accepted
+                                  ↓
+                        Temporal Workflow
+                                  ↓
+                        CallProviderActivity  ← retries on transient errors
+                                  ↓
+                        UpdatePaymentStatusActivity
+                                  ↓ (on success)
+                        InsertBalanceLogActivity
+                        UpsertDailyStatsActivity
 ```
 
----
+Two binaries:
+- **`cmd/server`** — HTTP API, accepts requests and starts workflows
+- **`cmd/worker`** — Temporal worker, executes workflow activities
 
-### 3. How the Go logic handles the 3 triggers
-
-In your Go code, you should wrap the "Write" and the "Projection Update" in a single `sql.Tx`.
-
-| Trigger | Action on `transactions` | Action on `partner_provider_balances` |
-| --- | --- | --- |
-| **New Transaction** | `INSERT` status 'success' | `UPDATE balance = balance - (amount + fee)` |
-| **Top-up (Пополнение)** | N/A (Only `balance_log`) | `UPDATE balance = balance + amount` |
-| **Cancellation** | `UPDATE` status 'canceled' | `UPDATE balance = balance + (amount + fee)` |
-
-### Example SQL for "UPSERT" Daily Stats (Go Logic)
-
-When a transaction succeeds, you run this alongside the insert:
-
-```sql
-INSERT INTO daily_stats_projection (day, provider_id, total_amount, success_count)
-VALUES (CURRENT_DATE, $1, $2, 1)
-ON CONFLICT (day, provider_id) DO UPDATE SET
-    total_amount = daily_stats_projection.total_amount + EXCLUDED.total_amount,
-    success_count = daily_stats_projection.success_count + 1;
+## Project Structure
 
 ```
+internal/
+  config/         — env-based config
+  domain/         — Payment, Provider, Partner, BalanceLog, DailyStats types
+  repository/     — pgx implementations (payments, balance_log, daily_stats, providers)
+  provider/       — mock provider client (70% success / 20% retryable / 10% terminal)
+  workflow/       — Temporal workflow + activities
+  api/            — HTTP handlers, router, middleware
+cmd/
+  server/         — HTTP server entry point
+  worker/         — Temporal worker entry point
+docs/
+  db.sql          — TimescaleDB schema
+```
 
----
+## Database Schema (TimescaleDB)
 
-### Why this works for your project:
+**Write side:**
+- `partners` — partner accounts
+- `providers` — payment provider connections (per partner)
+- `payments` — all payment records (hypertable, partitioned by `pay_date`)
+- `balance_log` — immutable audit log of every balance movement (hypertable)
 
-* **Filtering:** To get all transactions with filters, you query the `transactions` table (Write side).
-* **Performance:** To show a dashboard of balances, you query `partner_provider_balances`. Even with 10 million transactions, this query returns in **<1ms** because it's only one row per partner/provider.
-* **Integrity:** The `balance_log` ensures that if a partner asks "Why is my balance $500?", you can sum the log and prove it.
+**Read side (projections):**
+- `daily_stats_projection` — aggregated counts and amounts per provider per day (hypertable)
 
-**Would you like me to generate the Go structs and a `GORM` or `sqlx` function to handle a "Payment" transaction?**
+## Payment Workflow
+
+1. Agent calls `POST /payments`
+2. Payment inserted with `status=1` (pending)
+3. `202 Accepted` returned immediately with `payment_id`
+4. Temporal workflow starts asynchronously:
+   - Calls mock provider with retry (up to 10 attempts, exponential backoff 1s→30s)
+   - Terminal error codes (e.g. insufficient funds) stop retries immediately
+   - Updates payment status to `2` (success) or `3` (failed)
+   - On success: inserts to `balance_log` and upserts `daily_stats_projection`
+
+## Payment Status Codes
+
+| Value | Meaning  |
+|-------|----------|
+| 1     | Pending  |
+| 2     | Success  |
+| 3     | Failed   |
+| 4     | Canceled |
+
+## Provider Error Codes
+
+| Code | Type      | Description        |
+|------|-----------|--------------------|
+| 0    | —         | None               |
+| 101  | Terminal  | Insufficient funds |
+| 102  | Terminal  | Invalid account    |
+| 201  | Retryable | Timeout            |
+| 202  | Retryable | Provider down      |
+
+## Running Locally
+
+**Prerequisites:** Go 1.22+, PostgreSQL with TimescaleDB, Temporal CLI
+
+```bash
+# 1. Apply schema
+psql $PGURL -f docs/db.sql
+
+# 2. Start Temporal dev server
+temporal server start-dev
+
+# 3. Start worker
+PGURL=postgres://user:pass@localhost:5432/db go run ./cmd/worker
+
+# 4. Start API server
+PGURL=postgres://user:pass@localhost:5432/db go run ./cmd/server
+
+# 5. Create a payment
+curl -X POST localhost:8080/payments \
+  -H 'Content-Type: application/json' \
+  -d '{"provider_id":1,"agent_id":"agent1","ref_id":"ref-001","amount":"100.50"}'
+# → {"payment_id":"...","status":"pending"}
+
+# 6. Poll status
+curl localhost:8080/payments/{payment_id}
+
+# 7. View workflow in Temporal UI
+open http://localhost:8233
+```
+
+## Environment Variables
+
+| Variable            | Default         | Description               |
+|---------------------|-----------------|---------------------------|
+| `PGURL`             | required        | PostgreSQL connection URL |
+| `TEMPORAL_HOST`     | `localhost:7233`| Temporal server address   |
+| `TEMPORAL_NAMESPACE`| `default`       | Temporal namespace        |
+| `HTTP_ADDR`         | `:8080`         | HTTP listen address       |
+
+## Idempotency
+
+- DB unique index on `(agent_id, ref_id, pay_date)` — duplicate inserts return `409 Conflict`
+- Temporal `WorkflowID = payment_id` — duplicate workflow starts are a no-op
