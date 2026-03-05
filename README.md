@@ -1,5 +1,9 @@
 # providers.io
 
+
+[presentation slides](https://docs.google.com/presentation/d/1qcVy6xtTf-4-ADQZIh--kl9XXgobN0NrKbQyZIghIXo/edit?usp=sharing)
+
+
 A demo payment service where agents submit payments via HTTP API. Payments are persisted immediately, then processed asynchronously via a **Temporal** workflow with automatic retries.
 
 ## Architecture
